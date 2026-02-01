@@ -121,15 +121,10 @@ Always provide a helpful response even if tools fail."""
     
     def _recently_uploaded(self, user_id: str) -> bool:
         """Check if files were recently uploaded (within last few messages)."""
-        # Simple heuristic - if files exist and conversation is short, assume recent upload
+        # Simple heuristic - if files exist, assume they should be used
         try:
             files = file_processor.get_file_context(user_id)
-            if not files:
-                return False
-            
-            # If we have files and very few messages, likely just uploaded
-            # This is a simple implementation - could be enhanced with timestamps
-            return len(files) > 0
+            return len(files) > 0  # If any files exist, consider them recent
         except:
             return False
     
@@ -160,12 +155,26 @@ Always provide a helpful response even if tools fail."""
             files = file_processor.get_file_context(user_id)
             has_files = bool(files)
             
-            # Detect file mode triggers
-            file_keywords = ["pdf", "file", "document", "image", "upload", "is pdf me", "file ke andar", "document me", "image me"]
+            # Detect file mode triggers - be more aggressive
+            file_keywords = ["pdf", "file", "document", "image", "upload", "is pdf me", "file ke andar", "document me", "image me", "what is", "tell me about", "explain"]
             user_mentions_files = any(keyword in user_message.lower() for keyword in file_keywords)
             
-            # Determine mode
+            # Enter FILE MODE if files exist AND (user mentions files OR asks vague questions)
             file_mode = has_files and (user_mentions_files or self._recently_uploaded(user_id))
+            
+            # Force file mode for common vague questions when files exist
+            if has_files and not file_mode:
+                vague_patterns = ["what is", "tell me", "explain", "about", "this"]
+                if any(pattern in user_message.lower() for pattern in vague_patterns):
+                    file_mode = True
+            
+            # Debug logging
+            logger.info(f"File mode detection: has_files={has_files}, user_mentions_files={user_mentions_files}, file_mode={file_mode}, message='{user_message}'")
+            
+            # If files exist, force file mode for ANY question
+            if has_files:
+                file_mode = True
+                logger.info(f"FORCING file mode because files exist")
             
             # Handle vague file questions ONLY in file mode
             if file_mode:
