@@ -8,6 +8,7 @@ from .llm_client import llm_client
 from .memory import memory
 from .rag import rag
 from .tools import tools
+from .file_processor import file_processor
 from .config import config
 
 logger = logging.getLogger(__name__)
@@ -47,14 +48,14 @@ Available tools:
 
 Always provide a helpful response even if tools fail."""
     
-    async def _prepare_messages(self, user_message: str, user_id: str) -> List[Dict]:
-        """Prepare message context with memory and RAG."""
+    async def _prepare_messages(self, user_message: str, user_id: str, include_files: bool = True) -> List[Dict]:
+        """Prepare message context with memory, RAG, and MANDATORY file context."""
         # Initialize Redis connections if needed
         if not llm_client.redis_client:
             await llm_client._init_redis()
         if not memory.redis_client:
             await memory._init_redis()
-        
+
         messages = []
         
         # Get conversation history first
@@ -64,6 +65,23 @@ Always provide a helpful response even if tools fail."""
         system_content = self.system_prompt.format(
             current_time=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
         )
+        
+        # CRITICAL: Add file context if available - THIS IS MANDATORY
+        files = file_processor.get_file_context(user_id)
+        if files and include_files:
+            system_content += "\n\n================================\nUPLOADED FILES (MANDATORY TO USE):\n================================\n"
+            
+            for file_data in files[-3:]:  # Last 3 files
+                if file_data.get("content"):
+                    system_content += f"\n--- {file_data['filename']} ({file_data['type']}) ---\n"
+                    content = file_data["content"]
+                    # Don't truncate too aggressively - keep more content
+                    if len(content) > 4000:
+                        content = content[:4000] + "... [content continues]"
+                    system_content += content + "\n"
+            
+            # Add strict instruction when files exist
+            system_content += "\n🚨 CRITICAL: User has uploaded files. ALL questions are about these files. You MUST reference file content in your answer. Generic responses = FAILURE."
         
         # Add memory context if user has history
         if history:
@@ -102,10 +120,10 @@ Always provide a helpful response even if tools fail."""
         for result in tool_results:
             messages.append(result)
         
-        # Get final response with instruction to be natural
+        # Get final response with instruction to be concise
         messages.append({
             "role": "system", 
-            "content": "Provide a natural response. Don't mention tool usage. Be direct and confident."
+            "content": "Give a short, direct response. Max 1-2 sentences. Be natural and confident."
         })
         
         final_response = await llm_client.complete(messages)
@@ -116,9 +134,30 @@ Always provide a helpful response even if tools fail."""
         start_time = asyncio.get_event_loop().time()
         
         try:
+            # Check if files exist first
+            files = file_processor.get_file_context(user_id)
+            has_files = bool(files)
+            
+            # Handle vague file questions immediately
+            if has_files:
+                user_lower = user_message.lower().strip()
+                vague_questions = [
+                    "what is in pdf", "what is in the pdf", "pdf me kya hai", 
+                    "explain pdf", "explain all pdf", "isme kya likha hai",
+                    "what is this", "what is in this", "summarize", "summary",
+                    "tell me about this", "what does this say"
+                ]
+                
+                if any(q in user_lower for q in vague_questions) or len(user_message.split()) <= 3:
+                    # Force file summary for vague questions
+                    user_message = "Give me a concise summary of the uploaded file content with main points."
+            
             # Handle capability queries
             if user_message.lower() in ["what can you do?", "what can you do", "capabilities", "help"]:
-                response_content = """I can help you with:
+                if has_files:
+                    response_content = "I can answer questions about your uploaded files, do calculations, search web, and remember our conversation. What do you want to know about your files?"
+                else:
+                    response_content = """I can help you with:
 
 • **Calculations** - Math problems, equations
 • **Current info** - Time, date, web searches  
@@ -139,8 +178,8 @@ Just ask me anything naturally!"""
                     "status": "success"
                 }
             
-            # Prepare context
-            messages = await self._prepare_messages(user_message, user_id)
+            # Prepare context with MANDATORY file inclusion
+            messages = await self._prepare_messages(user_message, user_id, include_files=True)
             
             # Get initial response
             response = await llm_client.complete(
@@ -151,6 +190,26 @@ Just ask me anything naturally!"""
             # Handle tool calls if present
             if response.get("tool_calls"):
                 response = await self._handle_tool_calls(response["tool_calls"], messages)
+            
+            # Ensure response is concise (but don't truncate file-based answers)
+            content = response["content"]
+            user_lower = user_message.lower().strip()
+            
+            # Only apply length limits if NO files exist
+            if not has_files and len(user_message.split()) <= 3 and len(content) > 50:
+                # For simple queries, keep it short
+                if any(op in user_message for op in ['+', '-', '*', '/', '=']) or 'what is' in user_lower:
+                    # Math queries - extract just the answer
+                    import re
+                    numbers = re.findall(r'\d+(?:,\d{3})*(?:\.\d+)?', content)
+                    if numbers:
+                        content = numbers[-1]  # Last number is usually the answer
+                elif user_lower in ['hi', 'hello', 'hey', 'namaste', 'hii', 'helo']:
+                    content = "Hello! 👋"
+                elif user_lower in ['or sab badhiya', 'kya haal', 'kaise ho', 'how are you']:
+                    content = "Sab badhiya! 😄 Tu bata?"
+            
+            response["content"] = content
             
             # Save to memory
             await asyncio.gather(
@@ -196,7 +255,7 @@ Just ask me anything naturally!"""
         """Stream response for real-time interaction."""
         try:
             # Prepare context
-            messages = await self._prepare_messages(user_message, user_id)
+            messages = await self._prepare_messages(user_message, user_id, include_files=True)
             
             # Stream response
             async for chunk in llm_client.stream_complete(messages):
