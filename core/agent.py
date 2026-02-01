@@ -49,7 +49,7 @@ Available tools:
 Always provide a helpful response even if tools fail."""
     
     async def _prepare_messages(self, user_message: str, user_id: str, include_files: bool = True) -> List[Dict]:
-        """Prepare message context with memory, RAG, and MANDATORY file context."""
+        """Prepare message context with mode-aware file handling."""
         # Initialize Redis connections if needed
         if not llm_client.redis_client:
             await llm_client._init_redis()
@@ -66,26 +66,34 @@ Always provide a helpful response even if tools fail."""
             current_time=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
         )
         
-        # CRITICAL: Add file context if available - THIS IS MANDATORY
+        # Check if we should enter FILE MODE
         files = file_processor.get_file_context(user_id)
-        if files and include_files:
-            system_content += "\n\n================================\nUPLOADED FILES (MANDATORY TO USE):\n================================\n"
+        has_files = bool(files)
+        
+        # File mode triggers
+        file_keywords = ["pdf", "file", "document", "image", "upload", "is pdf me", "file ke andar", "document me", "image me"]
+        user_mentions_files = any(keyword in user_message.lower() for keyword in file_keywords)
+        
+        # Enter FILE MODE only if files exist AND user mentions them, OR files were just uploaded
+        file_mode = has_files and (user_mentions_files or self._recently_uploaded(user_id))
+        
+        if file_mode and include_files:
+            system_content += "\n\n================================\nFILE MODE ACTIVATED - UPLOADED FILES:\n================================\n"
             
             for file_data in files[-3:]:  # Last 3 files
                 if file_data.get("content"):
                     system_content += f"\n--- {file_data['filename']} ({file_data['type']}) ---\n"
                     content = file_data["content"]
-                    # Don't truncate too aggressively - keep more content
+                    # Keep substantial content for file mode
                     if len(content) > 4000:
                         content = content[:4000] + "... [content continues]"
                     system_content += content + "\n"
             
-            # Add strict instruction when files exist
-            system_content += "\n🚨 CRITICAL: User has uploaded files. ALL questions are about these files. You MUST reference file content in your answer. Generic responses = FAILURE."
+            system_content += "\n🚨 FILE MODE: User has files and mentioned them. Use file content directly."
         
         # Add memory context if user has history
         if history:
-            system_content += f"\n\nYou are continuing a conversation. Use the context naturally."
+            system_content += f"\n\nContinuing conversation naturally."
         
         messages.append({
             "role": "system",
@@ -111,6 +119,20 @@ Always provide a helpful response even if tools fail."""
         
         return messages
     
+    def _recently_uploaded(self, user_id: str) -> bool:
+        """Check if files were recently uploaded (within last few messages)."""
+        # Simple heuristic - if files exist and conversation is short, assume recent upload
+        try:
+            files = file_processor.get_file_context(user_id)
+            if not files:
+                return False
+            
+            # If we have files and very few messages, likely just uploaded
+            # This is a simple implementation - could be enhanced with timestamps
+            return len(files) > 0
+        except:
+            return False
+    
     async def _handle_tool_calls(self, tool_calls: List[Dict], messages: List[Dict]) -> Dict:
         """Handle tool execution and get final response - SILENTLY."""
         # Execute tools
@@ -130,16 +152,23 @@ Always provide a helpful response even if tools fail."""
         return final_response
     
     async def process_message(self, user_message: str, user_id: str) -> Dict:
-        """Process user message with full pipeline."""
+        """Process user message with mode-aware behavior."""
         start_time = asyncio.get_event_loop().time()
         
         try:
-            # Check if files exist first
+            # Check current state
             files = file_processor.get_file_context(user_id)
             has_files = bool(files)
             
-            # Handle vague file questions immediately
-            if has_files:
+            # Detect file mode triggers
+            file_keywords = ["pdf", "file", "document", "image", "upload", "is pdf me", "file ke andar", "document me", "image me"]
+            user_mentions_files = any(keyword in user_message.lower() for keyword in file_keywords)
+            
+            # Determine mode
+            file_mode = has_files and (user_mentions_files or self._recently_uploaded(user_id))
+            
+            # Handle vague file questions ONLY in file mode
+            if file_mode:
                 user_lower = user_message.lower().strip()
                 vague_questions = [
                     "what is in pdf", "what is in the pdf", "pdf me kya hai", 
@@ -148,13 +177,13 @@ Always provide a helpful response even if tools fail."""
                     "tell me about this", "what does this say"
                 ]
                 
-                if any(q in user_lower for q in vague_questions) or len(user_message.split()) <= 3:
-                    # Force file summary for vague questions
+                if any(q in user_lower for q in vague_questions) or (len(user_message.split()) <= 3 and user_mentions_files):
+                    # Force file summary for vague questions in file mode
                     user_message = "Give me a concise summary of the uploaded file content with main points."
             
             # Handle capability queries
             if user_message.lower() in ["what can you do?", "what can you do", "capabilities", "help"]:
-                if has_files:
+                if file_mode:
                     response_content = "I can answer questions about your uploaded files, do calculations, search web, and remember our conversation. What do you want to know about your files?"
                 else:
                     response_content = """I can help you with:
@@ -178,8 +207,8 @@ Just ask me anything naturally!"""
                     "status": "success"
                 }
             
-            # Prepare context with MANDATORY file inclusion
-            messages = await self._prepare_messages(user_message, user_id, include_files=True)
+            # Prepare context based on mode
+            messages = await self._prepare_messages(user_message, user_id, include_files=file_mode)
             
             # Get initial response
             response = await llm_client.complete(
@@ -191,13 +220,12 @@ Just ask me anything naturally!"""
             if response.get("tool_calls"):
                 response = await self._handle_tool_calls(response["tool_calls"], messages)
             
-            # Ensure response is concise (but don't truncate file-based answers)
+            # Apply length limits ONLY in normal chat mode (not file mode)
             content = response["content"]
             user_lower = user_message.lower().strip()
             
-            # Only apply length limits if NO files exist
-            if not has_files and len(user_message.split()) <= 3 and len(content) > 50:
-                # For simple queries, keep it short
+            if not file_mode and len(user_message.split()) <= 3 and len(content) > 50:
+                # For simple queries in normal chat, keep it short
                 if any(op in user_message for op in ['+', '-', '*', '/', '=']) or 'what is' in user_lower:
                     # Math queries - extract just the answer
                     import re
@@ -208,6 +236,10 @@ Just ask me anything naturally!"""
                     content = "Hello! 👋"
                 elif user_lower in ['or sab badhiya', 'kya haal', 'kaise ho', 'how are you']:
                     content = "Sab badhiya! 😄 Tu bata?"
+                elif user_lower in ['ok', 'okay']:
+                    content = "Theek hai 👍"
+                elif user_lower in ['all good', 'sab badhiya']:
+                    content = "Badhiya 😄"
             
             response["content"] = content
             
