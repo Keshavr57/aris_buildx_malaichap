@@ -21,12 +21,12 @@ function Chat() {
   const { user, logout } = useAuth();
 
   const suggestions = [
-    "What can you do?",
-    "What's 25 × 17?", 
-    "What time is it?",
-    "Tell me a joke",
-    "Help me with math",
-    "Search for latest news"
+    "Should I learn React or Vue?",
+    "Help me plan my startup", 
+    "I have too many tasks to organize",
+    "Which job offer should I take?",
+    "How do I prepare for interviews?",
+    "Prioritize my college work"
   ];
 
   // Initialize speech recognition and synthesis
@@ -73,7 +73,7 @@ function Chat() {
     setMessages([{
       id: 1,
       role: 'assistant',
-      content: `Hey ${user?.username}! 👋 I'm your AI assistant. I can help with calculations, questions, web searches, and I'll remember our conversations. You can type or use voice! What's on your mind?`,
+      content: `Hey ${user?.username}! 👋 I'm your AI Thinking Assistant. I help you decide between options, plan your goals, and organize your tasks. What would you like help thinking through today?`,
       timestamp: new Date().toISOString()
     }]);
   }, [user]);

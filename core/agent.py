@@ -10,6 +10,10 @@ from .rag import rag
 from .tools import tools
 from .file_processor import file_processor
 from .config import config
+from .intent_classifier import intent_classifier
+from .prompt_templates import response_templates
+from .response_validator import response_validator
+from .hard_enforcer import hard_enforcer
 
 logger = logging.getLogger(__name__)
 
@@ -48,115 +52,78 @@ Available tools:
 
 Always provide a helpful response even if tools fail."""
     
-    async def _prepare_messages(self, user_message: str, user_id: str, include_files: bool = False) -> List[Dict]:
-        """Prepare message context with memory and RAG for thinking assistant."""
-        # Initialize Redis connections if needed
-        if not llm_client.redis_client:
-            await llm_client._init_redis()
-        if not memory.redis_client:
-            await memory._init_redis()
-
-        messages = []
-        
-        # Get conversation history first
-        history = await memory.get_context_messages(user_id)
-        
-        # Build context-aware system prompt
-        system_content = self.system_prompt.format(
-            current_time=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-        )
-        
-        # Add memory context if user has history
-        if history:
-            system_content += f"\n\nContinuing conversation naturally."
-        
-        messages.append({
-            "role": "system",
-            "content": system_content
-        })
-        
-        # Add RAG context silently if available
-        rag_context = await rag.get_context(user_message)
-        if rag_context:
-            messages.append({
-                "role": "system",
-                "content": f"Context: {rag_context}"
-            })
-        
-        # Add conversation history
-        messages.extend(history)
-        
-        # Add current user message
-        messages.append({
-            "role": "user",
-            "content": user_message
-        })
-        
-        return messages
+    async def _prepare_messages(self, user_message: str, user_id: str, intent: str) -> List[Dict]:
+        """Legacy method - redirects to strict version."""
+        return await self._prepare_messages_strict(user_message, user_id, intent)
 
     
-    async def _handle_tool_calls(self, tool_calls: List[Dict], messages: List[Dict]) -> Dict:
-        """Handle tool execution and get final response - SILENTLY."""
-        # Execute tools
-        tool_results = await tools.execute_tool_calls(tool_calls)
-        
-        # Add tool results to messages
-        for result in tool_results:
-            messages.append(result)
-        
-        # Get final response with instruction to be concise
-        messages.append({
-            "role": "system", 
-            "content": "Give a short, direct response. Max 1-2 sentences. Be natural and confident."
-        })
-        
-        final_response = await llm_client.complete(messages)
-        return final_response
-    
+
     async def process_message(self, user_message: str, user_id: str) -> Dict:
-        """Process user message with thinking assistant behavior."""
+        """Process user message with ULTRA-STRICT enforcement."""
         start_time = asyncio.get_event_loop().time()
         
         try:
-            # Handle capability queries
-            if user_message.lower() in ["what can you do?", "what can you do", "capabilities", "help"]:
-                response_content = """I'm an AI Thinking Assistant. I help you:
-
-• **Decide** - Choose between options with pros/cons
-• **Plan** - Break goals into actionable steps  
-• **Organize** - Structure tasks and priorities
-• **Chat** - Brief support for the above
-
-What would you like help thinking through?"""
+            # STEP 1: HARD CHAT MODE OVERRIDE - NO LLM
+            intent = intent_classifier.classify(user_message)
+            
+            if intent == "CHAT":
+                chat_response = hard_enforcer.handle_chat_mode(user_message)
                 
                 await memory.add_message(user_id, "user", user_message)
-                await memory.add_message(user_id, "assistant", response_content)
+                await memory.add_message(user_id, "assistant", chat_response)
                 
                 return {
-                    "content": response_content,
+                    "content": chat_response,
                     "user_id": user_id,
                     "duration": round(asyncio.get_event_loop().time() - start_time, 3),
                     "tool_calls_made": 0,
-                    "status": "success"
+                    "status": "success",
+                    "intent": "CHAT"
                 }
             
-            # Prepare context for thinking assistant
-            messages = await self._prepare_messages(user_message, user_id, include_files=False)
+            # STEP 2: ORGANIZE MODE - HARD OVERRIDE for health/stress mentions
+            if intent == "ORGANIZE" or any(word in user_message.lower() for word in ["health", "stress", "overwhelmed", "anxiety", "college", "side hustle"]):
+                # Force ORGANIZE intent if health/stress mentioned
+                if intent == "CHAT" and any(word in user_message.lower() for word in ["college", "side hustle", "family work", "responsibilities"]):
+                    intent = "ORGANIZE"
+                
+                organize_response = hard_enforcer.fix_organize_response(user_message)
+                
+                await memory.add_message(user_id, "user", user_message)
+                await memory.add_message(user_id, "assistant", organize_response)
+                
+                return {
+                    "content": organize_response,
+                    "user_id": user_id,
+                    "duration": round(asyncio.get_event_loop().time() - start_time, 3),
+                    "tool_calls_made": 0,
+                    "status": "success",
+                    "intent": "ORGANIZE"
+                }
             
-            # Get initial response
-            response = await llm_client.complete(
-                messages, 
-                tools=tools.get_tool_definitions()
-            )
+            # STEP 3: For DECIDE/PLAN - use LLM with STRICT enforcement
+            messages = await self._prepare_messages_strict(user_message, user_id, intent)
             
-            # Handle tool calls if present
-            if response.get("tool_calls"):
-                response = await self._handle_tool_calls(response["tool_calls"], messages)
+            # Get response (no tools to keep it focused)
+            response = await llm_client.complete(messages)
             
-            # Keep responses structured and concise for thinking assistant
-            content = response["content"]
+            # STEP 4: ULTRA-STRICT validation
+            if response.get("content"):
+                # Check for banned content first
+                if hard_enforcer.has_banned_content(response["content"]):
+                    response["content"] = self._get_clean_fallback(intent, user_message)
+                else:
+                    response["content"] = response_validator.ultra_strict_validate(
+                        response["content"], intent
+                    )
+                    
+                    # Fix DECIDE responses (remove Options section)
+                    if intent == "DECIDE":
+                        response["content"] = hard_enforcer.fix_decide_response(response["content"])
             
-            response["content"] = content
+            # STEP 5: Final safety check
+            if hard_enforcer.has_banned_content(response.get("content", "")):
+                response["content"] = self._get_clean_fallback(intent, user_message)
             
             # Save to memory
             await asyncio.gather(
@@ -164,24 +131,24 @@ What would you like help thinking through?"""
                 memory.add_message(user_id, "assistant", response["content"])
             )
             
-            # Calculate timing
             duration = asyncio.get_event_loop().time() - start_time
             
             return {
                 "content": response["content"],
                 "user_id": user_id,
                 "duration": round(duration, 3),
-                "tool_calls_made": len(response.get("tool_calls", [])),
-                "status": "success"
+                "tool_calls_made": 0,
+                "status": "success",
+                "intent": intent
             }
             
         except Exception as e:
             logger.error(f"Agent processing error: {e}")
             
-            # Graceful fallback
-            fallback = "Let me help you think through this. Could you clarify what you need help deciding, planning, or organizing?"
+            # Clean fallback
+            intent = intent_classifier.classify(user_message)
+            fallback = self._get_clean_fallback(intent, user_message)
             
-            # Still save to memory
             try:
                 await memory.add_message(user_id, "user", user_message)
                 await memory.add_message(user_id, "assistant", fallback)
@@ -195,27 +162,108 @@ What would you like help thinking through?"""
                 "user_id": user_id,
                 "duration": round(duration, 3),
                 "tool_calls_made": 0,
-                "status": "success"
+                "status": "success",
+                "intent": intent
             }
     
+    async def _prepare_messages_strict(self, user_message: str, user_id: str, intent: str) -> List[Dict]:
+        """Prepare messages with ULTRA-STRICT context."""
+        # Initialize Redis connections if needed
+        if not llm_client.redis_client:
+            await llm_client._init_redis()
+        if not memory.redis_client:
+            await memory._init_redis()
+
+        messages = []
+        
+        # INJECT student context HARD
+        student_context = hard_enforcer.get_student_context()
+        system_prompt = response_templates.get_system_prompt(intent)
+        
+        messages.append({
+            "role": "system",
+            "content": f"{student_context}\n\n{system_prompt}"
+        })
+        
+        # NO conversation history to prevent bloat
+        # NO RAG context to prevent advice injection
+        
+        # Add current user message
+        messages.append({
+            "role": "user",
+            "content": user_message
+        })
+        
+        return messages
+    
+    def _get_clean_fallback(self, intent: str, user_input: str) -> str:
+        """Get guaranteed clean fallback."""
+        if intent == "DECIDE":
+            return """**Decision:** Need specific options
+
+**Recommendation:** Provide clear choices
+
+**Reason:**
+• Cannot decide without alternatives
+• Need exact options
+
+**Do this today:** List the options you're choosing between."""
+        
+        elif intent == "PLAN":
+            return """**Goal:** Unclear objective
+
+**Steps:**
+1. Define specific goal
+2. Set deadline
+3. List requirements
+4. Create timeline
+5. Start first task
+
+**Do this today:** State exactly what you want to achieve."""
+        
+        elif intent == "ORGANIZE":
+            return hard_enforcer.fix_organize_response(user_input)
+        
+        else:  # CHAT
+            return "Batao."
+    
     async def stream_response(self, user_message: str, user_id: str) -> AsyncGenerator[str, None]:
-        """Stream response for real-time interaction."""
+        """Stream response with ULTRA-STRICT validation."""
         try:
-            # Prepare context
-            messages = await self._prepare_messages(user_message, user_id, include_files=True)
+            # HARD CHAT MODE OVERRIDE
+            intent = intent_classifier.classify(user_message)
+            
+            if intent == "CHAT":
+                chat_response = hard_enforcer.handle_chat_mode(user_message)
+                yield chat_response
+                return
+            
+            # For other intents, use strict preparation
+            messages = await self._prepare_messages_strict(user_message, user_id, intent)
             
             # Stream response
+            response_content = ""
             async for chunk in llm_client.stream_complete(messages):
+                response_content += chunk
                 yield chunk
             
-            # Save to memory (fire and forget)
+            # ULTRA-STRICT validation of streamed response
+            if response_content:
+                if hard_enforcer.has_banned_content(response_content):
+                    yield f"\n\n[Clean response]\n{self._get_clean_fallback(intent, user_message)}"
+                else:
+                    fixed_content = response_validator.ultra_strict_validate(response_content, intent)
+                    if fixed_content != response_content:
+                        yield f"\n\n[Enforced structure]\n{fixed_content}"
+            
+            # Save to memory
             asyncio.create_task(
                 memory.add_message(user_id, "user", user_message)
             )
             
         except Exception as e:
             logger.error(f"Streaming error: {e}")
-            yield "I encountered an error. Please try again."
+            yield "Error. Be specific about what you need."
     
     async def get_status(self) -> Dict:
         """Get agent status and stats."""
